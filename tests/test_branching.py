@@ -1,7 +1,7 @@
 """ENGINEERING.md 2a (drillgroup, 2026-10-21): decisions go into tables,
 not long chains. Six or more branches on one variable is a finding.
 
-The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, 0d9e003),
+The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, ddcd2b9),
 copied unchanged with its planted cases: it counts elif chains, flat sibling
 ifs and match statements, and a branch names a variable through a comparison,
 a method receiver, a call's last positional argument and `not`. `isinstance`,
@@ -69,6 +69,8 @@ def _subjects(test, modules: frozenset = frozenset()) -> set[str]:
     def named(node) -> bool:
         return _named(node) and _root(node) not in modules
     if isinstance(test, ast.Compare):
+        if isinstance(test.left, ast.Constant) and test.comparators:
+            return {ast.unparse(test.comparators[0])}     # "a" == op -> op
         return {ast.unparse(test.left)}
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         return _subjects(test.operand, modules)
@@ -105,16 +107,61 @@ def _scopes(tree) -> dict[int, str]:
     return out
 
 
+def _tests(node, modules) -> list[set[str]]:
+    """The subjects of every test along an if/elif chain."""
+    out, cur = [], node
+    while True:
+        out.append(_subjects(cur.test, modules))
+        if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
+            cur = cur.orelse[0]
+        else:
+            return out
+
+
+def _elifs(node) -> list:
+    out, cur = [], node
+    while len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
+        cur = cur.orelse[0]
+        out.append(cur)
+    return out
+
+
 def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
-    """Findings as (site, kind, variable, count), sorted. `site` is
-    file:function, where GLYPHDRILL's reference reports file:lineno."""
+    """Six or more branches on one variable: in one if/elif chain, or in a
+    run of sibling `if` statements counted together with the chains among
+    them (`if a: .. if b: .. if c: .. elif d: ..`). A chain inside a run
+    that is reported is not reported again. Match statements by cases.
+
+    Findings as (site, kind, variable, count), sorted. `site` is
+    file:function, where GLYPHDRILL's reference reports file:lineno.
+    """
     tree = ast.parse(source)
     modules = frozenset(_imported(tree))
     scope = _scopes(tree)
-    found = []
+    found, covered = [], set()
 
     def site(node) -> str:
         return f"{name}:{scope.get(id(node), '<module>')}"
+
+    for node in ast.walk(tree):            # runs of sibling if statements
+        for field in ("body", "orelse", "finalbody"):
+            body = getattr(node, field, None)
+            if not isinstance(body, list):
+                continue
+            run = []
+            for stmt in [*body, None]:
+                if isinstance(stmt, ast.If):
+                    run.append(stmt)
+                    continue
+                if len(run) >= 2:
+                    tests = [(s, sub) for s in run for sub in _tests(s, modules)]
+                    for subj in sorted(set().union(*(sub for _, sub in tests))):
+                        n = sum(subj in sub for _, sub in tests)
+                        if n >= LIMIT:
+                            first = next(s for s, sub in tests if subj in sub)
+                            found.append((site(first), "sibling-ifs", subj, n))
+                            covered |= {(id(s), subj) for s in run}
+                run = []
 
     inner = set()                      # elif nodes, counted with their head
     for node in ast.walk(tree):
@@ -122,36 +169,12 @@ def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
             found.append((site(node), "match", ast.unparse(node.subject), len(node.cases)))
         if not isinstance(node, ast.If) or id(node) in inner:
             continue
-        subjects, cur = [], node
-        while True:
-            subjects.append(_subjects(cur.test, modules))
-            if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
-                cur = cur.orelse[0]
-                inner.add(id(cur))
-            else:
-                break
+        inner |= {id(e) for e in _elifs(node)}
+        subjects = _tests(node, modules)
         for s in sorted(set().union(*subjects)):
             n = sum(s in sub for sub in subjects)
-            if n >= LIMIT:
+            if n >= LIMIT and (id(node), s) not in covered:
                 found.append((site(node), "elif", s, n))
-
-    for node in ast.walk(tree):            # flat runs: `if ..: return` x n
-        body = getattr(node, "body", None)
-        if not isinstance(body, list):
-            continue
-        run = []
-        for stmt in [*body, None]:
-            if isinstance(stmt, ast.If) and not stmt.orelse:
-                run.append(stmt)
-                continue
-            subjects = [_subjects(s.test, modules) for s in run]
-            for s in sorted(set().union(*subjects) if subjects else set()):
-                n = sum(s in sub for sub in subjects)
-                if n >= LIMIT:
-                    first = next(r for r in run
-                                 if s in _subjects(r.test, modules))
-                    found.append((site(first), "sibling-ifs", s, n))
-            run = []
     return sorted(found)
 
 
@@ -295,6 +318,39 @@ def test_a_module_is_not_a_subject():
                    "p.isfile(s)", "rx.match('x', s)",
                    "not rx.search('y', s)", "s.endswith('z')"], head)
     assert chains(same, "f.py") == [("f.py:f", "elif", "s", 6)]
+
+
+def test_a_constant_on_the_left_names_the_variable():
+    src = _chain([f"'{c}' == op" for c in "abcdef"])
+    assert chains(src, "k.py") == [("k.py:f", "elif", "op", 6)]
+
+
+def test_sibling_ifs_and_a_following_chain_count_together():
+    src = ("def f(name, args):\n"
+           + "".join(f"    if name in T{k}:\n        return {k}\n"
+                     for k in range(4))
+           + "    if name == 'sqrt':\n        return 4\n"
+           + "    elif name in DROP:\n        return 5\n"
+           + "    elif name in SYM:\n        return 6\n")
+    assert chains(src, "l.py") == [("l.py:f", "sibling-ifs", "name", 7)]
+    five = ("def f(name):\n"
+            + "".join(f"    if name in T{k}:\n        return {k}\n"
+                      for k in range(3))
+            + "    if name == 'a':\n        return 3\n"
+            + "    elif x:\n        return 4\n")
+    assert chains(five, "m.py") == []
+
+
+def test_a_chain_inside_a_reported_run_is_not_reported_twice():
+    """The merge's point: one site, not two. Six in the chain alone, and
+    four siblings before it, would be an elif finding and a sibling finding
+    on `tag` in the old rule."""
+    src = ("def f(tag):\n"
+           + "".join(f"    if tag == 'x{k}':\n        return {k}\n"
+                     for k in range(4))
+           + "".join(f"    {'if' if k == 0 else 'elif'} tag == 'y{k}':\n"
+                     f"        return {k}\n" for k in range(6)))
+    assert chains(src, "n.py") == [("n.py:f", "sibling-ifs", "tag", 10)]
 
 
 def test_the_baseline_catches_growth_shrink_and_stale_entries():
