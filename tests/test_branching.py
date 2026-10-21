@@ -8,8 +8,9 @@ this repository is a fork of lucasastorian/llmwiki and already has offenders:
   * a finding is keyed by `file:function`, not by line number, so the
     baseline survives edits above the site;
   * `tests/branching_baseline.txt` lists what exists today. The test fails
-    on a site that is not in the list, on a site whose count grew, and on a
-    stale entry. The list may only shrink.
+    on a site that is not in the list, on a site whose count grew, on a
+    count that shrank without the list being lowered, and on a stale entry.
+    The list only shrinks, and it follows every fix.
 
 The baseline carries a fourth column, the kind of site (elif / sibling-ifs /
 match), because one function can branch on the same variable in two shapes.
@@ -138,14 +139,18 @@ def read_baseline() -> dict[tuple[str, str, str], int]:
 
 
 def compare(found: dict, baseline: dict) -> dict[str, list[str]]:
-    """The three ways the gate fails. A count that shrank is allowed to lag."""
-    return {
-        "new": sorted(_format(k, n) for k, n in found.items() if k not in baseline),
-        "grown": sorted(
+    """The four ways the gate fails."""
+    def drifted(direction):
+        return sorted(
             f"{_format(k, n)} (baseline {baseline[k]})"
             for k, n in found.items()
-            if k in baseline and n > baseline[k]
-        ),
+            if k in baseline and direction(n, baseline[k])
+        )
+
+    return {
+        "new": sorted(_format(k, n) for k, n in found.items() if k not in baseline),
+        "grown": drifted(lambda n, b: n > b),
+        "shrunk": drifted(lambda n, b: n < b),
         "stale": sorted(_format(k, n) for k, n in baseline.items() if k not in found),
     }
 
@@ -157,6 +162,10 @@ def test_no_new_or_grown_branching_in_the_package():
         "(ENGINEERING.md 2a):\n  " + "\n  ".join(bad["new"])
     )
     assert bad["grown"] == [], "a baselined site grew:\n  " + "\n  ".join(bad["grown"])
+    assert bad["shrunk"] == [], (
+        "these sites got better — lower them in tests/branching_baseline.txt, "
+        "the list follows every fix:\n  " + "\n  ".join(bad["shrunk"])
+    )
     assert bad["stale"] == [], (
         "these sites are gone — remove them from tests/branching_baseline.txt, "
         "the list only shrinks:\n  " + "\n  ".join(bad["stale"])
@@ -191,16 +200,20 @@ def test_the_check_names_the_enclosing_method():
     assert chains(src, "c.py") == [("c.py:C.m", "elif", "op", 6)]
 
 
-def test_the_baseline_catches_growth_and_stale_entries():
-    site = ("api/x.py:f", "elif", "op", 6)
-    base = {site[:3]: 6}
-    assert compare({site[:3]: 6}, base) == {"new": [], "grown": [], "stale": []}
+def test_the_baseline_catches_growth_shrink_and_stale_entries():
+    key = ("api/x.py:f", "elif", "op")
+    base = {key: 7}
+    assert compare({key: 7}, base) == {"new": [], "grown": [], "shrunk": [], "stale": []}
 
-    grown = compare({site[:3]: 7}, base)
-    assert grown["grown"] == ["api/x.py:f | elif | op | 7 (baseline 6)"]
-    assert grown["new"] == [] and grown["stale"] == []
+    grown = compare({key: 8}, base)
+    assert grown["grown"] == ["api/x.py:f | elif | op | 8 (baseline 7)"]
+    assert grown["new"] == [] and grown["shrunk"] == [] and grown["stale"] == []
 
-    assert compare({}, base)["stale"] == ["api/x.py:f | elif | op | 6"]
+    shrunk = compare({key: 6}, base)      # still a finding, but the list must follow
+    assert shrunk["shrunk"] == ["api/x.py:f | elif | op | 6 (baseline 7)"]
+    assert shrunk["grown"] == [] and shrunk["stale"] == []
+
+    assert compare({}, base)["stale"] == ["api/x.py:f | elif | op | 7"]
     assert compare({("api/y.py:g", "match", "kind"): 8}, base)["new"] == [
         "api/y.py:g | match | kind | 8"
     ]

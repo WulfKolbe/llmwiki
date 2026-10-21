@@ -2,8 +2,9 @@
 #
 # What exists today: six or more branches on one variable, per
 # `file:function | kind | variable | count`. tests/test_branching.py fails on
-# a site that is not here, on a site whose count grew, and on an entry whose
-# site is gone. The list may only shrink.
+# a site that is not here, on a site whose count grew, on a count that shrank
+# without this list being lowered, and on an entry whose site is gone. The
+# list only shrinks, and it follows every fix.
 #
 # All four entries are upstream code (lucasastorian/llmwiki, last touched by
 # 5f0b9cb "Bug fixes"); this fork has not changed api/html_parser/parser.py.
