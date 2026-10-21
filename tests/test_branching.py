@@ -1,7 +1,7 @@
 """ENGINEERING.md 2a (drillgroup, 2026-10-21): decisions go into tables,
 not long chains. Six or more branches on one variable is a finding.
 
-The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, ddcd2b9),
+The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, fc34d57),
 copied unchanged with its planted cases: it counts elif chains, flat sibling
 ifs and match statements, and a branch names a variable through a comparison,
 a method receiver, a call's last positional argument and `not`. `isinstance`,
@@ -33,6 +33,9 @@ SKIP = {"__pycache__", ".venv", "venv", "node_modules", "migrations", "scripts"}
 
 #: calls that are not decisions on a variable (type tests)
 UNCOUNTED_CALLS = {"isinstance", "issubclass"}
+#: statements a run of sibling ifs passes over (audit fbf36b2: 3 + 3 ifs
+#: split by one assignment); a compound statement ends the run
+PASSED_OVER = (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Pass)
 
 
 def _named(node) -> bool:
@@ -108,13 +111,18 @@ def _scopes(tree) -> dict[int, str]:
 
 
 def _tests(node, modules) -> list[set[str]]:
-    """The subjects of every test along an if/elif chain."""
+    """The subjects of every test along an if/elif chain, and of the ifs
+    directly in its final `else:` block (audit fbf36b2: a chain continued
+    there)."""
     out, cur = [], node
     while True:
         out.append(_subjects(cur.test, modules))
         if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
             cur = cur.orelse[0]
         else:
+            for stmt in cur.orelse:
+                if isinstance(stmt, ast.If):
+                    out += _tests(stmt, modules)
             return out
 
 
@@ -153,6 +161,8 @@ def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
                 if isinstance(stmt, ast.If):
                     run.append(stmt)
                     continue
+                if isinstance(stmt, PASSED_OVER):
+                    continue
                 if len(run) >= 2:
                     tests = [(s, sub) for s in run for sub in _tests(s, modules)]
                     for subj in sorted(set().union(*(sub for _, sub in tests))):
@@ -188,22 +198,30 @@ def sources() -> list[Path]:
     return out
 
 
-def scan() -> dict[tuple[str, str, str], int]:
-    """{(site, kind, variable): count} over the whole package."""
-    found = {}
+def scan() -> dict[tuple[str, str, str], tuple[int, ...]]:
+    """{(site, kind, variable): counts} over the whole package.
+
+    One function can hold two separate runs of the same kind on the same
+    variable — Parser._process_node does, 11 in its body and 8 inside
+    `if tag in TRACKED_BLOCKS:`. So the value is every count for that key,
+    largest first, not their maximum: a second site must not be able to
+    hide behind a larger one, which is the same reason the key carries the
+    kind column.
+    """
+    found: dict[tuple[str, str, str], list[int]] = {}
     for p in sources():
         rel = p.relative_to(ROOT).as_posix()
         for site, kind, var, n in chains(p.read_text(), rel):
-            found[site, kind, var] = max(n, found.get((site, kind, var), 0))
-    return found
+            found.setdefault((site, kind, var), []).append(n)
+    return {k: tuple(sorted(v, reverse=True)) for k, v in found.items()}
 
 
-def _format(key, count) -> str:
+def _format(key, counts) -> str:
     site, kind, var = key
-    return f"{site} | {kind} | {var} | {count}"
+    return f"{site} | {kind} | {var} | {','.join(str(n) for n in counts)}"
 
 
-def read_baseline() -> dict[tuple[str, str, str], int]:
+def read_baseline() -> dict[tuple[str, str, str], tuple[int, ...]]:
     if not BASELINE.exists():
         return {}
     out = {}
@@ -211,24 +229,32 @@ def read_baseline() -> dict[tuple[str, str, str], int]:
         line = raw.split("#")[0].strip()
         if not line:
             continue
-        site, kind, var, count = (f.strip() for f in line.split("|"))
-        out[site, kind, var] = int(count)
+        site, kind, var, counts = (f.strip() for f in line.split("|"))
+        out[site, kind, var] = tuple(sorted(
+            (int(c) for c in counts.split(",")), reverse=True))
     return out
 
 
 def compare(found: dict, baseline: dict) -> dict[str, list[str]]:
-    """The four ways the gate fails."""
-    def drifted(direction):
-        return sorted(
-            f"{_format(k, n)} (baseline {baseline[k]})"
-            for k, n in found.items()
-            if k in baseline and direction(n, baseline[k])
-        )
+    """The four ways the gate fails. Both values are counts largest first:
+    more sites than the baseline, or any count above its counterpart, is
+    growth; anything else that differs is a fix the list has not followed."""
+    def drifted(worse: bool):
+        out = []
+        for k, counts in found.items():
+            if k not in baseline or counts == baseline[k]:
+                continue
+            base = baseline[k]
+            grew = len(counts) > len(base) or any(c > b for c, b in zip(counts, base))
+            if grew is worse:
+                out.append(f"{_format(k, counts)} (baseline "
+                           f"{','.join(str(n) for n in base)})")
+        return sorted(out)
 
     return {
         "new": sorted(_format(k, n) for k, n in found.items() if k not in baseline),
-        "grown": drifted(lambda n, b: n > b),
-        "shrunk": drifted(lambda n, b: n < b),
+        "grown": drifted(True),
+        "shrunk": drifted(False),
         "stale": sorted(_format(k, n) for k, n in baseline.items() if k not in found),
     }
 
@@ -341,6 +367,28 @@ def test_sibling_ifs_and_a_following_chain_count_together():
     assert chains(five, "m.py") == []
 
 
+def test_sibling_ifs_split_by_an_assignment_count_together():
+    """Audit of the fixes (fbf36b2): 3 + 3 ifs with one assignment
+    between them evaded the run."""
+    src = ("def f(op):\n"
+           + "".join(f"    if op == {k}:\n        return {k}\n" for k in range(3))
+           + "    y = 1\n"
+           + "".join(f"    if op == {k}:\n        return {k}\n" for k in range(3, 6)))
+    assert chains(src, "n.py") == [("n.py:f", "sibling-ifs", "op", 6)]
+    loop = src.replace("    y = 1\n", "    for _ in ():\n        pass\n")
+    assert chains(loop, "o.py") == []
+
+
+def test_a_chain_continued_in_an_else_block_counts_whole():
+    src = ("def f(op):\n"
+           + "".join(f"    {'if' if k == 0 else 'elif'} op == {k}:\n        return {k}\n"
+                     for k in range(3))
+           + "    else:\n        y = 1\n"
+           + "".join(f"        {'if' if k == 3 else 'elif'} op == {k}:\n            return {k}\n"
+                     for k in range(3, 6)))
+    assert chains(src, "p.py") == [("p.py:f", "elif", "op", 6)]
+
+
 def test_a_chain_inside_a_reported_run_is_not_reported_twice():
     """The merge's point: one site, not two. Six in the chain alone, and
     four siblings before it, would be an elif finding and a sibling finding
@@ -355,24 +403,47 @@ def test_a_chain_inside_a_reported_run_is_not_reported_twice():
 
 def test_the_baseline_catches_growth_shrink_and_stale_entries():
     key = ("api/x.py:f", "elif", "op")
-    base = {key: 7}
-    assert compare({key: 7}, base) == {"new": [], "grown": [], "shrunk": [], "stale": []}
+    base = {key: (7,)}
+    assert compare({key: (7,)}, base) == {
+        "new": [], "grown": [], "shrunk": [], "stale": []}
 
-    grown = compare({key: 8}, base)
+    grown = compare({key: (8,)}, base)
     assert grown["grown"] == ["api/x.py:f | elif | op | 8 (baseline 7)"]
     assert grown["new"] == [] and grown["shrunk"] == [] and grown["stale"] == []
 
-    shrunk = compare({key: 6}, base)      # still a finding, but the list must follow
+    shrunk = compare({key: (6,)}, base)   # still a finding, but the list must follow
     assert shrunk["shrunk"] == ["api/x.py:f | elif | op | 6 (baseline 7)"]
     assert shrunk["grown"] == [] and shrunk["stale"] == []
 
     assert compare({}, base)["stale"] == ["api/x.py:f | elif | op | 7"]
-    assert compare({("api/y.py:g", "match", "kind"): 8}, base)["new"] == [
+    assert compare({("api/y.py:g", "match", "kind"): (8,)}, base)["new"] == [
         "api/y.py:g | match | kind | 8"
     ]
+
+
+def test_a_second_site_in_one_function_cannot_hide_behind_a_larger_one():
+    """Parser._process_node holds two runs of the same kind on `tag`, 11 in
+    its body and 8 inside a nested if. Aggregating by the maximum would
+    drop the 8 and then miss a new site of six."""
+    key = ("api/x.py:f", "sibling-ifs", "tag")
+    base = {key: (11, 8)}
+    assert compare({key: (11, 8)}, base)["grown"] == []
+
+    appeared = compare({key: (11, 8, 6)}, base)
+    assert appeared["grown"] == [
+        "api/x.py:f | sibling-ifs | tag | 11,8,6 (baseline 11,8)"]
+
+    fixed = compare({key: (11,)}, base)   # the nested run put into a table
+    assert fixed["shrunk"] == ["api/x.py:f | sibling-ifs | tag | 11 (baseline 11,8)"]
+    assert fixed["grown"] == []
+
+    mixed = compare({key: (12,)}, base)   # one grew, one went: growth wins
+    assert mixed["grown"] == ["api/x.py:f | sibling-ifs | tag | 12 (baseline 11,8)"]
+    assert mixed["shrunk"] == []
 
 
 def test_the_baseline_file_is_readable_and_every_entry_is_a_finding():
     base = read_baseline()
     assert base, "the baseline exists; a repository without offenders deletes it"
-    assert all(n >= LIMIT for n in base.values()), "a baseline entry below the limit"
+    assert all(n >= LIMIT for counts in base.values() for n in counts), \
+        "a baseline entry below the limit"

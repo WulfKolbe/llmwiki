@@ -1,17 +1,27 @@
 # Branching baseline — ENGINEERING.md 2a, T-0057.
 #
 # What exists today: six or more branches on one variable, per
-# `file:function | kind | variable | count`. tests/test_branching.py fails on
-# a site that is not here, on a site whose count grew, on a count that shrank
-# without this list being lowered, and on an entry whose site is gone. The
-# list only shrinks, and it follows every fix.
+# `file:function | kind | variable | counts`. tests/test_branching.py fails on
+# a site that is not here, on a site whose count grew or whose function gained
+# another site, on a count that shrank or a site that went without this list
+# being lowered, and on an entry whose site is gone. The list only shrinks,
+# and it follows every fix.
 #
-# All four entries are upstream code (lucasastorian/llmwiki, last touched by
-# 5f0b9cb "Bug fixes"); this fork has not changed api/html_parser/parser.py.
-# They are baselined, not rewritten — turning the HTML tag dispatch into a
-# table is a change to upstream's parser and belongs in its own task.
+# The counts field holds one number per site, largest first: one function can
+# hold two separate runs of the same kind on the same variable, and the second
+# must not be able to hide behind the first.
+#
+# All of it is upstream code (lucasastorian/llmwiki, last touched by 5f0b9cb
+# "Bug fixes"); this fork has not changed api/html_parser/parser.py. It is
+# baselined, not rewritten — turning the HTML tag dispatch into a table is a
+# change to upstream's parser and belongs in its own task.
+#
+# _process_node's two sites are its function body (11 tests on tag) and the
+# block inside `if tag in TRACKED_BLOCKS:` at line 497 (8). Until reference
+# rule fc34d57 the second was reported as an elif chain; the rule now counts
+# the run of sibling ifs that contains it, which is the same site under
+# another kind. The code did not change.
 #
 api/html_parser/parser.py:Parser._infer_kind | sibling-ifs | tag | 7
 api/html_parser/parser.py:Parser._plaintext_node | sibling-ifs | tag | 10
-api/html_parser/parser.py:Parser._process_node | elif | tag | 8
-api/html_parser/parser.py:Parser._process_node | sibling-ifs | tag | 11
+api/html_parser/parser.py:Parser._process_node | sibling-ifs | tag | 11,8
