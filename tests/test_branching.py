@@ -1,9 +1,14 @@
 """ENGINEERING.md 2a (drillgroup, 2026-10-21): decisions go into tables,
 not long chains. Six or more branches on one variable is a finding.
 
-Taken from GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, a2a6eeb).
-The rule and its planted cases are unchanged. Two things are added, because
-this repository is a fork of lucasastorian/llmwiki and already has offenders:
+The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, 0d9e003),
+copied unchanged with its planted cases: it counts elif chains, flat sibling
+ifs and match statements, and a branch names a variable through a comparison,
+a method receiver, a call's last positional argument and `not`. `isinstance`,
+plain truthiness and modules name nothing.
+
+Two things are added, because this repository is a fork of
+lucasastorian/llmwiki and already has offenders:
 
   * a finding is keyed by `file:function`, not by line number, so the
     baseline survives edits above the site;
@@ -13,7 +18,9 @@ this repository is a fork of lucasastorian/llmwiki and already has offenders:
     The list only shrinks, and it follows every fix.
 
 The baseline carries a fourth column, the kind of site (elif / sibling-ifs /
-match), because one function can branch on the same variable in two shapes.
+match), as the settled T-0057 contract requires: one function can branch on
+the same variable in two shapes, and without the column the two collide on
+one key and the smaller count reads as a shrink against the larger.
 """
 import ast
 from pathlib import Path
@@ -24,15 +31,60 @@ LIMIT = 6
 PACKAGES = ("api", "converter", "mcp")
 SKIP = {"__pycache__", ".venv", "venv", "node_modules", "migrations", "scripts"}
 
+#: calls that are not decisions on a variable (type tests)
+UNCOUNTED_CALLS = {"isinstance", "issubclass"}
 
-def _subject(test) -> str | None:
-    """The variable an `if` compares: `x == ..`, `x in ..`, `x is ..`."""
+
+def _named(node) -> bool:
+    return isinstance(node, ast.Name | ast.Attribute)
+
+
+def _imported(tree) -> set[str]:
+    """Names an import binds in the module: `import os` (os), `import
+    os.path` (os), `import re as rx` (rx), `from x import y as z` (z)."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out |= {a.asname or a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            out |= {a.asname or a.name for a in node.names}
+    return out
+
+
+def _root(node) -> str | None:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _subjects(test, modules: frozenset = frozenset()) -> set[str]:
+    """The variables an `if` decides on (T-0057 rule, 2026-10-21):
+    the left side of a comparison (`x == ..`, `x in ..`, `x < ..`,
+    `x is ..`); the receiver of a method call (`s.startswith(..)` -> s);
+    the last positional argument of a call (`re.match(p, s)` -> s);
+    through `not`; a BoolOp names what all its parts name. `isinstance`
+    and plain truthiness name nothing, and neither does a module: a name
+    an import binds, or an attribute chain starting with one
+    (`os.path.exists(a)` names only a)."""
+    def named(node) -> bool:
+        return _named(node) and _root(node) not in modules
     if isinstance(test, ast.Compare):
-        return ast.unparse(test.left)
+        return {ast.unparse(test.left)}
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _subjects(test.operand, modules)
     if isinstance(test, ast.BoolOp):
-        subs = {_subject(v) for v in test.values}
-        return subs.pop() if len(subs) == 1 else None
-    return None
+        subs = [_subjects(v, modules) for v in test.values]
+        return set.intersection(*subs) if subs else set()
+    if isinstance(test, ast.Call):
+        if isinstance(test.func, ast.Name) and test.func.id in UNCOUNTED_CALLS:
+            return set()
+        out = set()
+        if isinstance(test.func, ast.Attribute) and named(test.func.value):
+            out.add(ast.unparse(test.func.value))
+        if test.args and named(test.args[-1]):
+            out.add(ast.unparse(test.args[-1]))
+        return out
+    return set()
 
 
 def _scopes(tree) -> dict[int, str]:
@@ -54,8 +106,10 @@ def _scopes(tree) -> dict[int, str]:
 
 
 def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
-    """Findings as (site, kind, variable, count), sorted."""
+    """Findings as (site, kind, variable, count), sorted. `site` is
+    file:function, where GLYPHDRILL's reference reports file:lineno."""
     tree = ast.parse(source)
+    modules = frozenset(_imported(tree))
     scope = _scopes(tree)
     found = []
 
@@ -70,14 +124,14 @@ def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
             continue
         subjects, cur = [], node
         while True:
-            subjects.append(_subject(cur.test))
+            subjects.append(_subjects(cur.test, modules))
             if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
                 cur = cur.orelse[0]
                 inner.add(id(cur))
             else:
                 break
-        for s in set(subjects) - {None}:
-            n = subjects.count(s)
+        for s in sorted(set().union(*subjects)):
+            n = sum(s in sub for sub in subjects)
             if n >= LIMIT:
                 found.append((site(node), "elif", s, n))
 
@@ -90,11 +144,12 @@ def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
             if isinstance(stmt, ast.If) and not stmt.orelse:
                 run.append(stmt)
                 continue
-            subjects = [_subject(s.test) for s in run]
-            for s in set(subjects) - {None}:
-                n = subjects.count(s)
+            subjects = [_subjects(s.test, modules) for s in run]
+            for s in sorted(set().union(*subjects) if subjects else set()):
+                n = sum(s in sub for sub in subjects)
                 if n >= LIMIT:
-                    first = next(r for r in run if _subject(r.test) == s)
+                    first = next(r for r in run
+                                 if s in _subjects(r.test, modules))
                     found.append((site(first), "sibling-ifs", s, n))
             run = []
     return sorted(found)
@@ -172,6 +227,12 @@ def test_no_new_or_grown_branching_in_the_package():
     )
 
 
+def _chain(tests: list[str], head: str = "", args: str = "s, x") -> str:
+    return head + f"def f({args}):\n" + "".join(
+        f"    {'if' if k == 0 else 'elif'} {t}:\n        return {k}\n"
+        for k, t in enumerate(tests))
+
+
 def test_the_check_sees_a_planted_chain():
     planted = "def f(op):\n" + "".join(
         f"    {'if' if k == 0 else 'elif'} op == {k}:\n        return {k}\n"
@@ -198,6 +259,42 @@ def test_the_check_names_the_enclosing_method():
         f"        {'if' if k == 0 else 'elif'} op == {k}:\n            return {k}\n"
         for k in range(6))
     assert chains(src, "c.py") == [("c.py:C.m", "elif", "op", 6)]
+
+
+def test_the_check_sees_method_calls_on_one_receiver():
+    src = _chain([f"s.startswith('{c}')" for c in "abcde"] + ["s.isdigit()"])
+    assert chains(src, "a.py") == [("a.py:f", "elif", "s", 6)]
+
+
+def test_the_check_sees_one_variable_as_the_last_argument():
+    src = _chain(["s.startswith('a')", "s.startswith('b')",
+                  "re.fullmatch('x+', s)", "re.match('y', s)",
+                  "not re.search('z', s)", "s.endswith('q')"])
+    assert chains(src, "b.py") == [("b.py:f", "elif", "s", 6)]
+
+
+def test_isinstance_and_truthiness_stay_uncounted():
+    src = _chain([f"isinstance(x, T{k})" for k in range(6)])
+    assert chains(src, "c.py") == []
+    src = _chain(["x"] * 6)
+    assert chains(src, "d.py") == []
+
+
+def test_a_module_is_not_a_subject():
+    head = "import os\nimport re as rx\nfrom os import path as p\n"
+    different = _chain([f"os.path.exists(a{k})" for k in range(6)], head)
+    assert chains(different, "e.py") == []
+    aliased = _chain([f"p.isdir(b{k})" for k in range(6)], head)
+    assert chains(aliased, "g.py") == []
+    one_path = _chain(
+        [f"os.path.{fn}(q)" for fn in ("exists", "isdir", "isfile", "islink",
+                                       "ismount", "isabs")],
+        "import os\n", args="q")
+    assert chains(one_path, "h.py") == [("h.py:f", "elif", "q", 6)]
+    same = _chain(["os.path.exists(s)", "os.path.isdir(s)",
+                   "p.isfile(s)", "rx.match('x', s)",
+                   "not rx.search('y', s)", "s.endswith('z')"], head)
+    assert chains(same, "f.py") == [("f.py:f", "elif", "s", 6)]
 
 
 def test_the_baseline_catches_growth_shrink_and_stale_entries():
