@@ -1,7 +1,7 @@
 """ENGINEERING.md 2a (drillgroup, 2026-10-21): decisions go into tables,
 not long chains. Six or more branches on one variable is a finding.
 
-The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, fc34d57),
+The rule is GLYPHDRILL's tests/test_branching.py (t-0021-blobs-ccl, 6e8f9a8),
 copied unchanged with its planted cases: it counts elif chains, flat sibling
 ifs and match statements, and a branch names a variable through a comparison,
 a method receiver, a call's last positional argument and `not`. `isinstance`,
@@ -134,6 +134,22 @@ def _elifs(node) -> list:
     return out
 
 
+def _final_else(node) -> list:
+    """The statements of an if/elif chain's final `else:` block."""
+    return (_elifs(node) or [node])[-1].orelse
+
+
+def _absorbed(node) -> list:
+    """The ifs a chain counts besides its head: its elifs, and the ifs
+    directly in its final else block with all they absorb in turn (so
+    that each is reported once, with the chain; coordinator, fc34d57)."""
+    out = _elifs(node)
+    for stmt in _final_else(node):
+        if isinstance(stmt, ast.If):
+            out += [stmt, *_absorbed(stmt)]
+    return out
+
+
 def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
     """Six or more branches on one variable: in one if/elif chain, or in a
     run of sibling `if` statements counted together with the chains among
@@ -156,6 +172,8 @@ def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
             body = getattr(node, field, None)
             if not isinstance(body, list):
                 continue
+            if isinstance(node, ast.If) and field == "orelse":
+                continue                   # a chain's else: the chain counts it
             run = []
             for stmt in [*body, None]:
                 if isinstance(stmt, ast.If):
@@ -179,7 +197,7 @@ def chains(source: str, name: str) -> list[tuple[str, str, str, int]]:
             found.append((site(node), "match", ast.unparse(node.subject), len(node.cases)))
         if not isinstance(node, ast.If) or id(node) in inner:
             continue
-        inner |= {id(e) for e in _elifs(node)}
+        inner |= {id(e) for e in _absorbed(node)}
         subjects = _tests(node, modules)
         for s in sorted(set().union(*subjects)):
             n = sum(s in sub for sub in subjects)
@@ -387,6 +405,26 @@ def test_a_chain_continued_in_an_else_block_counts_whole():
            + "".join(f"        {'if' if k == 3 else 'elif'} op == {k}:\n            return {k}\n"
                      for k in range(3, 6)))
     assert chains(src, "p.py") == [("p.py:f", "elif", "op", 6)]
+
+
+def test_ifs_in_an_else_block_are_reported_once():
+    """Reported from here on fc34d57: the ifs of a chain's final else block
+    were counted by the chain and again as a sibling run."""
+    three = ("def f(op):\n"
+             + "".join(f"    {'if' if k == 0 else 'elif'} op == {k}:\n        return {k}\n"
+                       for k in range(3))
+             + "    else:\n"
+             + "".join(f"        if op == {k}:\n            return {k}\n"
+                       for k in range(3, 6)))
+    assert chains(three, "q.py") == [("q.py:f", "elif", "op", 6)]
+    six = ("def f(op):\n    if op == 0:\n        return 0\n    else:\n"
+           + "".join(f"        if op == {k}:\n            return {k}\n"
+                     for k in range(1, 7)))
+    assert chains(six, "r.py") == [("r.py:f", "elif", "op", 7)]
+    nested = ("def f(op):\n    if op == 0:\n        return 0\n    else:\n"
+              + "".join(f"        {'if' if k == 1 else 'elif'} op == {k}:\n"
+                        f"            return {k}\n" for k in range(1, 7)))
+    assert chains(nested, "s.py") == [("s.py:f", "elif", "op", 7)]
 
 
 def test_a_chain_inside_a_reported_run_is_not_reported_twice():
