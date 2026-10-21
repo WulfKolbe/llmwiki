@@ -1,0 +1,16 @@
+# Branching baseline — ENGINEERING.md 2a, T-0057.
+#
+# What exists today: six or more branches on one variable, per
+# `file:function | kind | variable | count`. tests/test_branching.py fails on
+# a site that is not here, on a site whose count grew, and on an entry whose
+# site is gone. The list may only shrink.
+#
+# All four entries are upstream code (lucasastorian/llmwiki, last touched by
+# 5f0b9cb "Bug fixes"); this fork has not changed api/html_parser/parser.py.
+# They are baselined, not rewritten — turning the HTML tag dispatch into a
+# table is a change to upstream's parser and belongs in its own task.
+#
+api/html_parser/parser.py:Parser._infer_kind | sibling-ifs | tag | 7
+api/html_parser/parser.py:Parser._plaintext_node | sibling-ifs | tag | 10
+api/html_parser/parser.py:Parser._process_node | elif | tag | 8
+api/html_parser/parser.py:Parser._process_node | sibling-ifs | tag | 11
